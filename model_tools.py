@@ -350,6 +350,37 @@ def _fn_def(schema: Dict[str, Any]) -> Dict[str, Any]:
     return {"type": "function", "function": schema}
 
 
+# Pointers to a tool in ANOTHER toolset, per tools/AGENTS.md: a static schema must not
+# name one, because the target may be absent (disabled toolset, missing key) and the model
+# then hallucinates calls to it. The static description says only what the tool does; the
+# pointer is appended here and only when the named tool is in this session's bundle.
+# Keyed by the tool whose description carries the pointer; each entry is
+# (target tool name, sentence to append when it is available).
+_CROSS_TOOLSET_POINTERS = {
+    "read_file": (("vision_analyze", " Use vision_analyze for images."),),
+    "web_extract": (
+        ("read_file", " Use read_file to page through the omitted middle."),
+        ("browser_navigate", " If a URL fails or times out, use browser_navigate instead."),
+    ),
+    "browser_snapshot": (("read_file", " Page through the rest with read_file."),),
+}
+
+
+def _rewrite_cross_toolset_pointers(td: Dict[str, Any], available: set) -> Dict[str, Any]:
+    """Append each cross-toolset pointer whose target this session actually has.
+
+    Table-driven, so a new pointer is a row rather than another rewriter.
+    """
+    hints = "".join(
+        hint
+        for target, hint in _CROSS_TOOLSET_POINTERS.get(td["function"]["name"], ())
+        if target in available
+    )
+    if not hints:
+        return td
+    return _fn_def({**td["function"], "description": td["function"].get("description", "") + hints})
+
+
 def _rewrite_execute_code(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
     """List only sandbox tools that are actually available."""
     # Without this, the model sees "web_search is available in execute_code" even when the API key isn't
@@ -477,6 +508,9 @@ _DYNAMIC_SCHEMA_REWRITERS = {
     "browser_vault_list": _rewrite_browser_vault,
     "browser_vault_fill": _rewrite_browser_vault,
     "delegate_task": _rewrite_delegate_task,
+    "read_file": _rewrite_cross_toolset_pointers,
+    "web_extract": _rewrite_cross_toolset_pointers,
+    "browser_snapshot": _rewrite_cross_toolset_pointers,
 }
 
 
