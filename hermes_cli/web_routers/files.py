@@ -95,16 +95,47 @@ def _is_sensitive_filename(name: str) -> bool:
 
 def _is_sensitive_path(path: Path) -> bool:
     """True when the basename is sensitive OR any path component (case-
-    insensitive) is a credential directory. Read-side guard (list/read/
-    download); the write endpoints are a separate threat class.
+    insensitive) is a credential directory.
 
-    Read-side only: this guards list/read/download (the #57505 exfil surface). The write endpoints
-    (upload/mkdir/delete) are a separate threat class handled by the write-path checks; extending this guard
-    to them is out of scope for this fix.
+    Guards BOTH directions: list/read/download (the #57505 exfil surface) AND
+    write/upload/mkdir/delete. The read side existed first and the write side was
+    documented as "handled by the write-path checks" — but those checks are path
+    SHAPE only (``..``, locked_root, must-be-absolute, regular-file, size caps), so
+    nothing stopped the same token from overwriting ``~/.hermes/.env`` with a hostile
+    ``OPENAI_BASE_URL`` (the real key then ships to a third party on the next provider
+    call) or unlinking it outright. A credential store the Files tab refuses to LIST
+    must not be a channel for MUTATING one either.
+
+    On the SSH-workspace backend the check runs against the REQUESTED path, before the
+    write: ``/api/fs/*`` routes to a remote adapter when the profile has one, and by the
+    time that adapter returns a resolved target the write has already landed.
+
+    The config editor is unaffected: it saves through ``/api/config`` →
+    ``atomic_config_write`` (the one-writer path), never through these file endpoints.
     """
     if _is_sensitive_filename(path.name):
         return True
     return any(part.lower() in _SENSITIVE_MANAGED_DIR_NAMES for part in path.parts)
+
+
+def _reject_sensitive_write(target) -> None:
+    """Refuse a write/mkdir/delete aimed at credential material.
+
+    409 rather than 404 on the write side: the path resolved and is inside the allowed
+    root, so a 404 would misreport it as missing and send the UI hunting for a file that
+    is right there. The detail names the sanctioned route so a user who genuinely wants
+    to edit settings is not left guessing.
+    """
+    path = Path(target)
+    if _is_sensitive_path(path):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{path.name} holds credentials and is not editable from the file "
+                f"browser. Use the Settings/Config editor, or `hermes config`, for "
+                f"config.yaml; manage secrets with `hermes setup`."
+            ),
+        )
 
 
 _FS_TEXT_SOURCE_MAX_BYTES = 64 * 1024 * 1024
@@ -624,6 +655,10 @@ async def stream_managed_file(request: Request, path: str):
 
 def _managed_write_target(path: str, request: Request, overwrite: bool):
     policy, target, display_path = _resolve_managed_path(path, request, for_write=True)
+    # One seam for upload / upload-stream, so a new managed-write endpoint inherits the
+    # credential guard instead of re-deciding it. mkdir and delete resolve their own
+    # targets and take it directly.
+    _reject_sensitive_write(target)
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=409, detail="A directory already exists at that path")
     if target.exists() and not overwrite:
@@ -718,6 +753,9 @@ async def upload_managed_file_stream(
 @router.post("/api/files/mkdir")
 async def create_managed_directory(payload: ManagedDirectoryCreate, request: Request):
     policy, target, display_path = _resolve_managed_path(payload.path, request, for_write=True)
+    # mkdir resolves its own target (no overwrite check to share), so it takes the guard
+    # directly rather than through _managed_write_target.
+    _reject_sensitive_write(target)
     if target.exists() and not target.is_dir():
         raise HTTPException(status_code=409, detail="A file already exists at that path")
     with _io_errors("Directory is not writable", "Could not create directory"):
@@ -728,6 +766,7 @@ async def create_managed_directory(payload: ManagedDirectoryCreate, request: Req
 @router.delete("/api/files")
 async def delete_managed_file(payload: ManagedFileDelete, request: Request):
     policy, target, display_path = _resolve_managed_path(payload.path, request)
+    _reject_sensitive_write(target)
     if policy.locked_root is not None and target == policy.locked_root:
         raise HTTPException(status_code=400, detail="Cannot delete the managed files root")
     if target.parent == target:
@@ -838,6 +877,9 @@ async def fs_write_text(payload: FsWriteText, profile: Optional[str] = None):
     text = payload.content or ""
     backend = await asyncio.to_thread(_fs_backend, profile)
     if backend is not None:
+        # Guard the REQUESTED path: the adapter resolves and writes in one call, so the
+        # returned target arrives after the write has already landed.
+        _reject_sensitive_write(payload.path)
         try:
             target, byte_size = await asyncio.to_thread(
                 backend.write_text,
@@ -850,6 +892,7 @@ async def fs_write_text(payload: FsWriteText, profile: Optional[str] = None):
         return {"ok": True, "path": target, "byteSize": byte_size}
 
     target = _fs_path(payload.path, decode_fallback=False)
+    _reject_sensitive_write(target)
     if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content too large")
 
