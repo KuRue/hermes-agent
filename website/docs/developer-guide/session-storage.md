@@ -270,7 +270,8 @@ indexed columns — see `SCHEMA_SQL` in `hermes_state_common.py` for the exact S
 
 ## Schema Version and Migrations
 
-Current schema version: **31**
+Current schema version: see `SCHEMA_VERSION` in `hermes_state_common.py` (the authoritative value;
+the table below is the history).
 
 The `schema_version` table stores a single integer. Simple column additions are handled declaratively by `_reconcile_columns()` (which diffs live columns against `SCHEMA_SQL` and ADDs any missing ones). The version-gated chain is reserved for data migrations and index/FTS changes that can't be expressed declaratively:
 

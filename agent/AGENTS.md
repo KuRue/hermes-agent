@@ -60,11 +60,21 @@ Adding one: register in that table (no `if name == ...` chain); `tools/todo_tool
   commands (`agent/skill_commands.py`) inject as a user message; subdirectory `AGENTS.md` hints
   (`agent/subdirectory_hints.py`) append to the tool result (head+tail truncated past `_MAX_HINT_CHARS = 32_000`;
   the truncation is logged, never queued as a chat status warning — `context_file_max_chars` does not raise that cap).
-- **Strict role alternation.** Never two same-role messages in a row; never a synthetic user
-  message injected mid-loop. The one exception is `/steer`, delivered as a standalone user row
-  after a tool result (`assistant(tool_calls) → tool → user` is legal on every provider path) —
-  never smeared onto the already-persisted tool row, which append-only persistence would leave
-  divergent from the live request. Cron deliveries live in their own session for this reason.
+- **Strict role alternation.** Never two same-role messages in a row. A synthetic user row may be
+  injected mid-loop ONLY as a standalone row after a tool result
+  (`assistant(tool_calls) → tool → user` is legal on every provider path) — never smeared onto the
+  already-persisted tool row, which append-only persistence would leave divergent from the live
+  request. Cron deliveries live in their own session for this reason.
+  **This is not a `/steer`-only exception** — `/steer` is one of five sanctioned families, all
+  delivered through that same legal seam (`turn_stop_gates.py` appends the row), all bounded, all
+  flagged so persistence and the finalizer can strip them: `/steer`; `_verification_stop_synthetic`
+  and `_pre_verify_synthetic` (verify-on-stop / `pre_verify` hook, capped by `max_verify_nudges()`);
+  `_kanban_stop_synthetic` (worker owes a terminal board tool); and `_dropped_toolcall_nudge` (model
+  signalled a tool call but sent none, `turn_final_response.py`, capped at 3 and never persisted).
+  Do not "fix" these as alternation bugs.
+  Distinct from that class: the run-budget wrapup and iteration-budget warning
+  (`conversation_loop.py`) append to the newest **tool result** row, not a user row — cache-safe for
+  the same reason `/steer` uses a separate row, and not an alternation concern at all.
 - **Context files** (`agent/prompt_builder.py`) load from the CWD only at startup and are capped
   (`CONTEXT_FILE_MAX_CHARS` / dynamic cap from the context window / `context_file_max_chars`).
   Never load an install-tree `AGENTS.md` as project context (PR #64611); subdirectory hints reject
