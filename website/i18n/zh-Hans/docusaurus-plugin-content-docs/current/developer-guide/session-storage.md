@@ -164,7 +164,7 @@ END;
 
 ## Schema 版本与迁移
 
-当前 schema 版本：**11**
+当前 schema 版本：以 `hermes_state_common.py` 中的 `SCHEMA_VERSION` 为准（权威值；下表为历史记录）。
 
 `schema_version` 表存储单个整数。简单的列添加由 `_reconcile_columns()` 声明式处理（对比实时列与 `SCHEMA_SQL` 并 ADD 缺失列）。版本门控链保留用于无法声明式表达的数据迁移及索引/FTS 变更：
 
