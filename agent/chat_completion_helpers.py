@@ -929,7 +929,7 @@ class _InlineRequest:
         # property). False = request finished or an interrupt owns the outcome; stay silent.
         if not self.abort("stale_call_kill"):
             return
-        elapsed = time.time() - self.call_start
+        elapsed = time.monotonic() - self.call_start
         _report_stale_nonstream_kill(self.agent, self.api_kwargs, elapsed, self.stale_timeout, inline=True)
         _touch_stale_kill_activity(self.agent, elapsed)
 
@@ -1024,7 +1024,10 @@ def direct_api_call(agent, api_kwargs: dict):
     agent._touch_activity("waiting for non-streaming API response")
     # Resolve the budget BEFORE the heartbeat starts: the resolver may raise
     # (fail-closed), and a leaked heartbeat thread would mask real stalls forever.
-    call_start = time.time()
+    # Monotonic: every consumer differences this against a later reading to measure an
+    # elapsed duration (the stale timer, the timeout message below). A wall-clock epoch
+    # put an NTP step straight into that arithmetic.
+    call_start = time.monotonic()
     stale_timeout = _resolve_direct_stale_timeout(agent, api_kwargs)
     # Never override an explicit per-call timeout; otherwise pin read=stale_timeout so a
     # no-op abort can't leave the read=None socket hanging until TCP dies (#85252).
@@ -1048,7 +1051,7 @@ def direct_api_call(agent, api_kwargs: dict):
             # Our own abort caused the transport error: raise a retryable
             # TimeoutError, never InterruptedError ("the user wants to stop").
             raise TimeoutError(
-                f"Non-streaming API call timed out after {int(time.time() - call_start)}s with no response "
+                f"Non-streaming API call timed out after {int(time.monotonic() - call_start)}s with no response "
                 f"(threshold: {int(stale_timeout)}s)") from None
         raise
     else:
