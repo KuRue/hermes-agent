@@ -544,3 +544,51 @@ def test_ssh_backend_write_never_reaches_the_adapter_for_a_credential_path(
 
     assert resp.status_code == 409, resp.text
     assert calls == [], f"the remote adapter was asked to write a credential path: {calls}"
+
+
+def test_write_text_refuses_to_clobber_a_live_database(forced_files_client):
+    """The spot editor replaces a file wholesale. On a SQLite database that destroys it —
+    and the dashboard process itself is holding state.db open, so `_serve_offline`
+    refuses that on the read side while the write side had no equivalent guard.
+
+    Asserted against a real SessionDB (a genuine live connection), not a mock: the guard
+    consults the live-connection registry, so a fabricated path would not exercise it.
+    """
+    from hermes_state import SessionDB
+
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    db_path = root / "state.db"
+    session_db = SessionDB(db_path=db_path)
+    try:
+        resp = client.post(
+            "/api/fs/write-text",
+            json={"path": str(db_path), "content": "not a database"},
+        )
+        assert resp.status_code == 409, resp.text
+        # Untouched: still a readable store, not the text we tried to write.
+        assert session_db.get_meta("__probe__") is None
+    finally:
+        session_db.close()
+
+
+def test_upload_refuses_to_clobber_a_live_database(forced_files_client):
+    """Same guard on the upload path, which can also target any writable path."""
+    from hermes_state import SessionDB
+
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    db_path = root / "state.db"
+    session_db = SessionDB(db_path=db_path)
+    try:
+        resp = client.post(
+            "/api/files/upload",
+            json={
+                "path": str(db_path),
+                "data_url": "data:application/octet-stream;base64,bm90IGEgZGF0YWJhc2U=",
+            },
+        )
+        assert resp.status_code == 409, resp.text
+        assert db_path.read_bytes().startswith(b"SQLite format 3")
+    finally:
+        session_db.close()
