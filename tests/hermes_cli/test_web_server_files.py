@@ -458,3 +458,89 @@ def test_git_branch_decodes_utf8_under_a_gbk_default_codec(tmp_path, monkeypatch
     monkeypatch.setattr(subprocess, "_text_encoding", lambda: "gbk")
 
     assert _rt_files._fs_git_branch(str(tmp_path)) == branch
+
+
+# --- Credential stores are guarded in BOTH directions -------------------------
+# The read side (#57505) refuses to list/read/download credential basenames. Its
+# docstring claimed the other direction was covered: "The write endpoints
+# (upload/mkdir/delete) are a separate threat class handled by the write-path
+# checks." Those checks are path SHAPE only (`..`, locked_root, must-be-absolute,
+# regular-file, size caps) — not one of them consults the denylist. So the same
+# token that cannot read ~/.hermes/.env could overwrite it (a hostile
+# OPENAI_BASE_URL there sends the real key to a third party on the next provider
+# call) or delete it outright.
+
+
+def test_dotenv_cannot_be_overwritten_through_the_file_browser(forced_files_client):
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    env_path = root / ".env"
+    env_path.write_text("OPENAI_API_KEY=sk-real-key\n", encoding="utf-8")
+
+    resp = client.post(
+        "/api/fs/write-text",
+        json={"path": str(env_path), "content": "OPENAI_BASE_URL=https://attacker.example\n"},
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert env_path.read_text(encoding="utf-8") == "OPENAI_API_KEY=sk-real-key\n"
+
+
+def test_dotenv_cannot_be_deleted_through_the_file_browser(forced_files_client):
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    env_path = root / ".env"
+    env_path.write_text("OPENAI_API_KEY=sk-real-key\n", encoding="utf-8")
+
+    resp = client.request("DELETE", "/api/files", json={"path": str(env_path)})
+
+    assert resp.status_code == 409, resp.text
+    assert env_path.exists()
+
+
+def test_ordinary_writes_still_work(forced_files_client):
+    """The guard must not cost the feature: a non-credential file is still writable,
+    creatable and deletable through the same endpoints."""
+    client, root = forced_files_client
+
+    # write-text never builds trees by design, so the parent is created first.
+    assert client.post("/api/files/mkdir", json={"path": str(root / "sub")}).status_code == 200
+
+    written = client.post(
+        "/api/fs/write-text",
+        json={"path": str(root / "sub" / "notes.md"), "content": "hello"},
+    )
+    assert written.status_code == 200, written.text
+    assert (root / "sub" / "notes.md").read_text(encoding="utf-8") == "hello"
+
+    deleted = client.request("DELETE", "/api/files", json={"path": str(root / "sub" / "notes.md")})
+    assert deleted.status_code == 200, deleted.text
+    assert not (root / "sub" / "notes.md").exists()
+
+
+def test_ssh_backend_write_never_reaches_the_adapter_for_a_credential_path(
+    monkeypatch, forced_files_client
+):
+    """``/api/fs/*`` routes to the profile's SSH workspace adapter when it has one, and
+    that adapter resolves and writes in a single call — so a guard placed on the
+    RESOLVED target would run after the write already landed. Assert the adapter is
+    never asked to write a credential path at all."""
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+
+    calls: list[tuple] = []
+
+    class _RecordingBackend:
+        def write_text(self, path, text, *, max_bytes=None):
+            calls.append((path, text))
+            return ("/remote/.env", len(text))
+
+    monkeypatch.setattr(_rt_files, "_fs_backend", lambda profile=None: _RecordingBackend())
+
+    resp = client.post(
+        "/api/fs/write-text",
+        json={"path": "/remote/.env", "content": "OPENAI_BASE_URL=https://attacker.example\n"},
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert calls == [], f"the remote adapter was asked to write a credential path: {calls}"
