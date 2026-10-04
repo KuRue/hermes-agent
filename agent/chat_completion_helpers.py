@@ -2869,7 +2869,12 @@ class _StreamingCall(StreamingWaitMonitor):
         self.deltas_were_sent = {"yes": False}  # for the partial-delivery fallback
         self.provider_tool_in_flight = {"yes": False}
         # Last REAL chunk; the monitor detects SSE-ping-only connections with it.
-        self.last_chunk_time = {"t": time.time()}
+        # MONOTONIC on purpose: every consumer subtracts it from a later reading to
+        # measure an elapsed duration (heartbeat interval, stale-stream kill, load-notice
+        # gating). A wall-clock epoch made an NTP step forward look like a silent stream
+        # and killed a healthy one, and a step backward disabled the detector outright.
+        # The ABSOLUTE first-chunk stamp that TTFB needs is taken separately below.
+        self.last_chunk_time = {"t": time.monotonic()}
         # Shared by the socket read timeout (``_stream_timeouts``) and the stale
         # detector (``_resolve_stale_timeout``); None until resolved.
         self._stream_stale_timeout = None
@@ -3006,12 +3011,14 @@ class _StreamingCall(StreamingWaitMonitor):
 
     def _count_chunk(self, diag, chunk) -> None:
         """Stamp liveness for a real chunk; diagnostics are best-effort."""
-        self.last_chunk_time["t"] = time.time()
+        self.last_chunk_time["t"] = time.monotonic()
         self.agent._touch_activity("receiving stream response")
         with contextlib.suppress(Exception):
             diag["chunks"] = int(diag.get("chunks", 0)) + 1
             if diag.get("first_chunk_at") is None:
-                diag["first_chunk_at"] = self.last_chunk_time["t"]
+                # Absolute epoch, NOT the monotonic liveness stamp above: this feeds
+                # TTFB (first_chunk_at - started_at) in turn_response_intake.
+                diag["first_chunk_at"] = time.time()
             # Delta-length estimate: ~3x cheaper than repr() per chunk.
             diag["bytes"] = int(diag.get("bytes", 0)) + _estimate_chunk_bytes(chunk)
 
@@ -3077,7 +3084,7 @@ class _StreamingCall(StreamingWaitMonitor):
             stream_kwargs["stream_options"] = {"include_usage": True}
         request_client = self._attempt_request_client = self.clients.set_client(
             self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
-        self.last_chunk_time["t"] = time.time()
+        self.last_chunk_time["t"] = time.monotonic()
         self.agent._touch_activity("waiting for provider response (streaming)")
         # #93650: as above — the streaming path carries the same bulk
         # messages/tools payload and pays the same client-side walk.
@@ -3133,7 +3140,7 @@ class _StreamingCall(StreamingWaitMonitor):
             return False
         # Stamp BEFORE Relay processes the chunk so the watchdog can't cancel
         # a live stream mid-interceptor.
-        self.last_chunk_time["t"] = time.time()
+        self.last_chunk_time["t"] = time.monotonic()
         return True
 
     def _writer_still_current(self, label: str) -> bool:
@@ -3505,7 +3512,7 @@ class _StreamingCall(StreamingWaitMonitor):
         # No message_stop -> EmptyStreamError; saw_stream_event only picks the message.
         saw_stream_event = False
         saw_message_stop = False
-        self.last_chunk_time["t"] = time.time()
+        self.last_chunk_time["t"] = time.monotonic()
         _diag = self._new_diag()
         self._writer_token = self._attempt_stream_response = None
         self._attempt_request_client = request_client
@@ -3959,7 +3966,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self._shutdown_stale_attempt_socket(_killed_response)
         self._count_stale_attempt()
         # Reset the timer so we don't kill repeatedly while the worker unwinds.
-        self.last_chunk_time["t"] = time.time()
+        self.last_chunk_time["t"] = time.monotonic()
         self.agent._emit_diagnostic_wait(f"⚠ no output from provider for {int(elapsed)}s — reconnecting...")
         self.agent._touch_activity(f"stale stream detected after {int(elapsed)}s, reconnecting")
 
