@@ -678,6 +678,7 @@ def _managed_write_result(policy, target: Path, display_path: str) -> dict:
 @router.post("/api/files/upload")
 async def upload_managed_file(payload: ManagedFileUpload, request: Request):
     policy, target, display_path = _managed_write_target(payload.path, request, payload.overwrite)
+    await asyncio.to_thread(_refuse_live_database, target)
     data, _mime_type = _decode_data_url(payload.data_url)
     with _io_errors("File is not writable", "Could not write file"):
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -739,6 +740,7 @@ async def upload_managed_file_stream(
     """Chunked multipart upload: constant memory and no base64 inflation, unlike
     the JSON data-URL endpoint that trips proxy body-size limits on large archives."""
     policy, target, display_path = _managed_write_target(path, request, overwrite)
+    await asyncio.to_thread(_refuse_live_database, target)
     with _io_errors("File is not writable", "Could not create parent directory"):
         target.parent.mkdir(parents=True, exist_ok=True)
     await stream_upload_to_path(
@@ -767,6 +769,7 @@ async def create_managed_directory(payload: ManagedDirectoryCreate, request: Req
 async def delete_managed_file(payload: ManagedFileDelete, request: Request):
     policy, target, display_path = _resolve_managed_path(payload.path, request)
     _reject_sensitive_write(target)
+    await asyncio.to_thread(_refuse_live_database, target)
     if policy.locked_root is not None and target == policy.locked_root:
         raise HTTPException(status_code=400, detail="Cannot delete the managed files root")
     if target.parent == target:
@@ -893,6 +896,11 @@ async def fs_write_text(payload: FsWriteText, profile: Optional[str] = None):
 
     target = _fs_path(payload.path, decode_fallback=False)
     _reject_sensitive_write(target)
+    # Whole-file replace is destructive to a live SQLite store (this process holds
+    # state.db open), and _serve_offline already refuses that on the read side.
+    # Not applied to the SSH backend: offline_file_access is a local-connection
+    # registry, so a remote database is not one of ours to guard here.
+    await asyncio.to_thread(_refuse_live_database, target)
     if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content too large")
 
