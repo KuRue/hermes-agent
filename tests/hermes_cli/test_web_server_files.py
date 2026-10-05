@@ -1,5 +1,6 @@
 """Tests for the dashboard-managed file browser API."""
 
+from pathlib import Path
 import base64
 from types import SimpleNamespace
 
@@ -592,3 +593,54 @@ def test_upload_refuses_to_clobber_a_live_database(forced_files_client):
         assert db_path.read_bytes().startswith(b"SQLite format 3")
     finally:
         session_db.close()
+
+
+def test_managed_files_guard_is_never_narrower_than_the_canonical_guard():
+    """The Files tab's credential guard must not lag behind the canonical one.
+
+    The two hand-listed tests in this file snapshot today's names, so they stay green when
+    ``agent.file_safety`` gains a credential store or directory — which is how
+    ``vault/`` and ``browser-profile/`` came to be readable here while the guard's own
+    comment claims it "mirrors the two canonical guards". This asserts the RELATIONSHIP
+    instead of the values: every canonical basename and every canonical credential
+    directory must be denied. The Files tab may be STRICTER (it also denies
+    config.yaml, .git-credentials and pairing/); it must never be narrower.
+    """
+    from agent.file_safety import _CREDENTIAL_FILE_NAMES, _READ_DENIED_DIRS
+
+    missing_files = sorted(
+        name for name in _CREDENTIAL_FILE_NAMES
+        if not _rt_files._is_sensitive_path(Path(name).parent / Path(name).name)
+    )
+    missing_dirs = sorted(
+        name for name, _dir_msg, _file_msg in _READ_DENIED_DIRS
+        if not _rt_files._is_sensitive_path(Path("hermes") / name / "anything.json")
+    )
+
+    assert not missing_files, (
+        f"credential basenames the Files tab would expose: {missing_files}. Add them to "
+        f"_SENSITIVE_MANAGED_FILE_BASENAMES."
+    )
+    assert not missing_dirs, (
+        f"credential directories the Files tab would expose: {missing_dirs}. Add them to "
+        f"_SENSITIVE_MANAGED_DIR_NAMES — a basename-only check still exposes their contents "
+        f"once the browser descends into the subdirectory."
+    )
+
+
+def test_vault_directory_is_not_readable_through_the_files_tab(forced_files_client):
+    """``vault.key`` + ``vault.json.enc`` side by side = plaintext, so the whole tree is one
+    credential. Asserted over HTTP against a realistic layout, not just the helper."""
+    client, root = forced_files_client
+    vault = root / "vault"
+    vault.mkdir(parents=True)
+    (vault / "vault.key").write_text("KEY", encoding="utf-8")
+    (vault / "vault.json.enc").write_text("CIPHERTEXT", encoding="utf-8")
+
+    for name in ("vault.key", "vault.json.enc"):
+        target = vault / name
+        assert client.get("/api/files/read", params={"path": str(target)}).status_code == 403, name
+        assert client.get("/api/files/download", params={"path": str(target)}).status_code == 403, name
+
+    entries = client.get("/api/files", params={"path": str(vault)}).json()["entries"]
+    assert entries == []
