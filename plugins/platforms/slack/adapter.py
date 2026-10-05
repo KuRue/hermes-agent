@@ -897,9 +897,18 @@ _SLACK_AUDIO_MIME_TO_EXT = {
     "audio/x-m4a": ".m4a", "audio/m4a": ".m4a", "audio/aac": ".m4a", "audio/flac": ".flac",
     "audio/x-flac": ".flac"}
 
-# Extensions Whisper-family STT accepts (in sync with tools/transcription_tools.SUPPORTED_FORMATS).
+# Extensions Whisper-family STT accepts — mirrors ``tools.transcription_common.SUPPORTED_FORMATS``
+# (the comment used to cite ``transcription_tools``, which no longer holds the constant; that stale
+# reference is how the copy below drifted). Kept as a literal rather than imported because this
+# adapter imports ``tools.*`` lazily inside functions throughout, and loading the transcription
+# stack at adapter-import time is not free. The invariant that matters — never NARROWER than the
+# backend, or an inbound clip is relabelled from the mimetype table below instead of keeping the
+# extension it arrived with — is enforced by
+# tests/plugins/platforms/test_slack_stt_extension_sync.py. A hand-copy silently lost .oga/.opus/.caf,
+# so an inbound .opus voice clip (the dominant chat format) fell through to the mimetype lookup.
 _SLACK_STT_SUPPORTED_EXTS = frozenset(
-    {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"})
+    {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".oga", ".opus", ".aac", ".flac",
+     ".caf"})
 
 # Cached extension → ``audio/*`` mimetype for ``video/mp4``-mislabeled voice clips (the STT gate
 # keys on the ``audio/`` prefix). Unmapped → ``audio/mp4``.
