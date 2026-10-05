@@ -62,9 +62,12 @@ _FS_READDIR_HIDDEN = {
 
 # Basenames the managed-files API must never list, read or download: credential
 # stores that become live secrets in the browsable tree the moment an operator
-# points the managed root at HERMES_HOME. Mirrors the two canonical guards
-# (agent.file_safety.get_read_block_error, gateway.platforms.base
-# ._ROOT_CREDENTIAL_FILES) so the Files tab never lags behind them.
+# points the managed root at HERMES_HOME. Mirrors the canonical guard
+# (agent.file_safety.get_read_block_error / _CREDENTIAL_FILE_NAMES), and is
+# deliberately stricter: config.yaml, .git-credentials and the Google/Bitwarden
+# caches are denied here too. The second guard this comment used to cite,
+# gateway.platforms.base._ROOT_CREDENTIAL_FILES, no longer exists — it was removed
+# with the platform-adapter decomposition, leaving the reference stale.
 # These typically contain credentials (API keys, tokens) and exposing them through the dashboard file
 # browser is a security leak — see issue #57505.
 _SENSITIVE_MANAGED_FILE_BASENAMES = frozenset({
@@ -74,12 +77,19 @@ _SENSITIVE_MANAGED_FILE_BASENAMES = frozenset({
     ".git-credentials",  # git's credential-store cache (file_safety blocks it too)
 })
 
-# Directory names whose whole subtree is credential material (the canonical
-# guards deny these as trees: _ROOT_CREDENTIAL_DIRS and the mcp-tokens/ prefix
-# match). The browser can descend into subdirs, so a basename-only guard would
-# still expose ``mcp-tokens/<server>.json``; match on ANY path component so the
+# Directory names whose whole subtree is credential material. Mirrors
+# ``agent.file_safety._READ_DENIED_DIRS`` (mcp-tokens/, browser-profile/, vault/),
+# plus ``pairing/``: the browser can descend into subdirs, so a basename-only guard
+# would still expose ``mcp-tokens/<server>.json``; match on ANY path component so the
 # trees are blocked wherever they sit under the root, no HERMES_HOME resolution.
-_SENSITIVE_MANAGED_DIR_NAMES = frozenset({"mcp-tokens", "pairing"})
+#
+# Kept as a literal rather than imported: the dashboard must not read agent internals
+# at import time (profile scope). Drift in either direction is caught by
+# tests/hermes_cli/test_web_server_files.py::test_managed_files_guard_is_never_narrower_than_the_canonical_guard
+# — that test is why vault/ and browser-profile/ were missing here for as long as they
+# were: the hand-listed tests in that file snapshot today's names instead of asserting
+# the relationship.
+_SENSITIVE_MANAGED_DIR_NAMES = frozenset({"mcp-tokens", "pairing", "vault", "browser-profile"})
 
 
 def _is_sensitive_filename(name: str) -> bool:
