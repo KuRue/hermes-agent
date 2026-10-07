@@ -55,12 +55,20 @@ _UNSAFE_ROOT_BINARIES = {
 _UNSAFE_ROOT_PREFIXES = ("mkfs",)
 
 # Substrings in a role='tool' result that mean the command did NOT execute with user consent
-# (blocked, denied, timed out, or still pending). Kept in sync with tools/approval.py templates.
+# (blocked, denied, timed out, or still pending). Every refusal template in tools/approval.py
+# and tools/approval_floors.py opens with a BLOCKED… prefix or carries the pending markers;
+# the contract test sweeps those sources for BLOCKED literals so this list cannot silently lag
+# a reworded template — a missed marker makes `approvals suggest` mine a never-executed (or
+# explicitly forbidden) command as approval evidence. "BLOCKED by user deny rule" matches no
+# current emitter but survives in history rows written by older versions.
 _BLOCK_MARKERS = (
     "BLOCKED (hardline)", "BLOCKED: User denied", "BLOCKED: Action ",
-    "BLOCKED: Command flagged as dangerous", "BLOCKED: approval required",
-    "BLOCKED: Failed to send approval request", "The user has NOT consented",
+    "BLOCKED: Command", "BLOCKED: approval required",
+    "BLOCKED: Failed to send", "The user has NOT consented",
     "Asking the user for approval", "approval_required", "BLOCKED by user deny rule",
+    "BLOCKED by smart approval", "BLOCKED: the Tirith security scanner",
+    "BLOCKED: execute_code", "requires approval (",
+    "but no interactive user or gateway is present", "user-defined deny rule",
 )
 
 
