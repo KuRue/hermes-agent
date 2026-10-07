@@ -142,6 +142,119 @@ class TestScan:
 
 
 # ---------------------------------------------------------------------------
+# Blocked-marker coverage (drift guard for _BLOCK_MARKERS)
+# ---------------------------------------------------------------------------
+
+_APPROVAL_SOURCES = ("tools/approval.py", "tools/approval_floors.py")
+
+_FILL = {
+    "reason": "was refused by the gateway approval policy",
+    "reason_addendum": "", "timeout_addendum": "", "breaker": "",
+    "description": "destructive git operation", "command": "git push --force",
+    "session_key": "agent:main:telegram:1", "pattern": "rm -rf *",
+}
+
+
+def _render(template: str) -> str:
+    try:
+        return template.format(**_FILL)
+    except KeyError:
+        return template
+
+
+def _gate_refusal_messages():
+    """Every module-level _GateSpec field that can land in a role='tool' result."""
+    for spec in (
+        approval_module._COMMAND_GATE, approval_module._EXECUTE_CODE_GATE, approval_module._ACTION_GATE,
+    ):
+        for field in ("notify_failed", "gateway_refused", "transport_denied", "cli_timeout", "cli_denied"):
+            text = getattr(spec, field, "")
+            if text:
+                yield _render(text)
+
+
+# Refusal shapes built inside functions (smart gate, fail-closed helpers, floors) — rendered
+# verbatim from their emitters; the source sweep below is the guard against rewording.
+_FUNCTIONAL_REFUSALS = (
+    "BLOCKED by smart approval: destructive git operation. The command was assessed as "
+    "genuinely dangerous. Do NOT retry.",
+    "BLOCKED: the Tirith security scanner could not be imported and security.tirith_fail_open "
+    "is false, so this command cannot be silently allowed — and cron jobs run without a user "
+    "present to approve it. Find an alternative approach, install tirith, or set "
+    "approvals.cron_mode: approve in config.yaml.",
+    "BLOCKED: execute_code runs arbitrary local Python (including subprocess calls that bypass "
+    "shell-string approval checks). Cron jobs run without a user present to approve it. Use "
+    "normal tools instead, or set approvals.cron_mode: approve only if this cron profile is "
+    "intentionally trusted.",
+    "BLOCKED: Tool 'web_search' requires approval (network egress) but no interactive user or "
+    "gateway is present to approve it. A plugin flagged this action for human confirmation.",
+    "BLOCKED: Tool 'web_search' requires approval (network egress) but cron jobs run without a "
+    "user present to approve it. Find an alternative approach. To allow code in cron jobs, set "
+    "approvals.cron_mode: approve in config.yaml.",
+    "BLOCKED: this command matches the user-defined deny rule 'rm -rf *' (approvals.deny in "
+    "config.yaml). It cannot be executed via the agent — not even with --yolo, /yolo, or "
+    "approvals.mode=off. Do NOT retry or rephrase this command; the user has explicitly "
+    "forbidden it.",
+    "BLOCKED (hardline): Disk wipe commands are on the unconditional blocklist and cannot be "
+    "executed via the agent — not even with --yolo, /yolo, approvals.mode=off, or cron approve "
+    "mode. If you genuinely need to run it, run it yourself in a terminal outside the agent.",
+)
+
+
+class TestBlockedMarkerCoverage:
+    """A refusal the markers fail to recognize is mined as implied consent: scan_approval_history
+    counts the command as executed and `approvals suggest` proposes allowing it."""
+
+    @pytest.mark.parametrize("result", [
+        *_gate_refusal_messages(),
+        *_FUNCTIONAL_REFUSALS,
+    ])
+    def test_refusal_result_is_never_mined_as_executed(self, db_path, result):
+        path, con = db_path
+        _add_terminal_call(con, "git push --force origin main", result=result)
+        assert scan_approval_history(path, days=0) == [], (
+            f"refusal result classified as executed: {result[:80]!r}..."
+        )
+
+    def test_executed_and_pending_controls(self, db_path):
+        path, con = db_path
+        _add_terminal_call(con, "git push --force origin main", result="ok: pushed")
+        _add_terminal_call(
+            con, "git push --force origin main",
+            result="⚠️ Dangerous command. Asking the user for approval.\n\n**Target:**\n```"
+                   "\ngit push --force origin main\n```")
+        records = scan_approval_history(path, days=0)
+        assert len(records) == 1  # only the genuinely executed call
+
+    def test_markers_cover_every_blocked_literal_in_approval_sources(self):
+        """Contract sweep: every string literal starting with BLOCKED in the approval sources
+        must be recognizable by some marker (literals whose subject is a variable — a bare
+        ``BLOCKED:`` prefix — are covered behaviorally above)."""
+        import ast
+        from pathlib import Path
+
+        from hermes_cli.approvals_suggest import _BLOCK_MARKERS
+        markers = tuple(m.rstrip() for m in _BLOCK_MARKERS)
+        repo_root = Path(__file__).resolve().parents[2]
+        missed = []
+        for rel in _APPROVAL_SOURCES:
+            tree = ast.parse((repo_root / rel).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                    continue
+                text = node.value.strip()
+                if not text.startswith("BLOCKED"):
+                    continue
+                head = text.split("{", 1)[0].rstrip(" .")
+                if head in ("BLOCKED", "BLOCKED:"):
+                    continue  # variable subject; pinned by the behavioral cases
+                if not any(m in head or head in m for m in markers):
+                    missed.append(f"{rel}: {head!r}")
+        assert not missed, (
+            f"BLOCKED templates no _BLOCK_MARKERS entry recognizes: {missed}")
+
+
+# ---------------------------------------------------------------------------
 # Normalize / glob derivation
 # ---------------------------------------------------------------------------
 
