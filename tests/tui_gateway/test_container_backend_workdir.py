@@ -62,6 +62,24 @@ def test_container_cwd_is_the_session_workspace(launch_home, monkeypatch, bridge
     assert server._display_session_cwd(session) == container
 
 
+@pytest.mark.parametrize("bridged", [False, True], ids=["config-only", "env-bridged"])
+def test_resume_fallback_cwd_matches_completion_tail(launch_home, monkeypatch, bridged):
+    """`_default_session_cwd` — session.resume's fallback when the row carries no stored cwd —
+    must resolve exactly like `_completion_cwd`'s tail (its docstring promises the mirror so
+    created AND resumed sessions land in the same workspace). Drifting to the gateway process's
+    own cwd re-breaks #103147 for resumed sessions: every host file looks "inside the workspace"
+    and attachments are never staged into the mounted dir."""
+    container = _container_dir()
+    if bridged:
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_CWD", container)
+    else:
+        _write_cfg(launch_home, f"terminal:\n  backend: docker\n  cwd: {container}\n")
+
+    assert server._completion_cwd({}) == container
+    assert server._default_session_cwd() == container
+
+
 def test_local_backend_missing_cwd_still_falls_back(launch_home):
     _write_cfg(launch_home, f"terminal:\n  backend: local\n  cwd: {_container_dir()}\n")
     assert server._completion_cwd({}) == os.getcwd()

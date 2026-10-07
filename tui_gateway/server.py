@@ -665,9 +665,12 @@ def _launch_configured_cwd() -> str | None:
 
 
 def _default_session_cwd() -> str:
-    """Fallback cwd when no explicit / stored / profile cwd (mirrors :func:`_completion_cwd`'s tail so created
-    AND resumed sessions land in the configured ``terminal.cwd``)."""
-    return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
+    """Fallback cwd when no explicit / stored / profile cwd — delegates to :func:`_completion_cwd`
+    so created AND resumed sessions land in the same workspace. The previous hand-copied tail
+    skipped ``_profile_workspace_cwd``, dropping resumed docker-backend sessions (no stored cwd)
+    into the gateway process's own cwd — every host file then looked "inside the workspace" and
+    attachments were never staged into the mounted dir (#103147)."""
+    return _completion_cwd({})
 
 
 def write_json(obj: dict) -> bool:
