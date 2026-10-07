@@ -1,51 +1,25 @@
-r"""Tests for _TOOL_MEDIA_RE regex patterns in gateway/run.py.
+r"""Tests for the _TOOL_MEDIA_RE pattern in gateway/run.py.
 
-Issue #34632: The _TOOL_MEDIA_RE patterns in GatewayRunner used (?:/|~\/) to
-anchor paths, which only matched Unix-style absolute and home-relative paths.
-Windows absolute paths (C:\\Users\\..., D:/...) were silently ignored, causing
-MEDIA directive delivery to fail on Windows.
+Issue #34632: _TOOL_MEDIA_RE used (?:/|~\/) to anchor paths, which only matched
+Unix-style absolute and home-relative paths. Windows absolute paths
+(C:\\Users\\..., D:/...) were silently ignored, causing MEDIA directive delivery
+to fail on Windows.
 
-Fix: Add [A-Za-z]:[/\\\\] as a third anchor alternative in both patterns.
-
-Two identical _TOOL_MEDIA_RE patterns exist in run.py:
-1. History scanning (~L17223): collects already-seen media paths
-2. Result scanning (~L17549): extracts new media tags from agent output
-
-This test file validates that both equivalent regex patterns correctly match
-Windows paths while preserving existing Unix path matching behavior.
+The pattern is IMPORTED from gateway/run.py — an earlier revision of this file
+reconstructed it by hand, so the tests kept passing while the production regex
+drifted (the aac/amr TTS gap below was invisible to them). Alongside the
+behavioral cases, the relationship test ties the regex to the extension
+vocabulary its gated producers actually emit.
 """
-
-import re
 
 import pytest
 
-
-# Reconstruct the exact _TOOL_MEDIA_RE pattern from gateway/run.py
-# The pattern is built by concatenating raw string parts:
-#   r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|...))'
-_TOOL_MEDIA_RE = re.compile(
-    r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-    r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-    r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-    r'txt|csv|apk|ipa))',
-    re.IGNORECASE,
-)
-
-
-# Reconstruct the pre-fix pattern (without Windows anchor) for regression proof
-_TOOL_MEDIA_RE_PRE_FIX = re.compile(
-    r'MEDIA:((?:/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-    r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-    r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-    r'txt|csv|apk|ipa))',
-    re.IGNORECASE,
-)
+from gateway.run import _TOOL_MEDIA_RE, _collect_auto_append_media_tags
+from tools.tts_command_provider import COMMAND_TTS_OUTPUT_FORMATS
 
 
 class TestToolMediaReWindowsPaths:
     """Issue #34632: _TOOL_MEDIA_RE must match Windows absolute paths."""
-
-    # ── Positive: Windows paths now match ──────────────────────────
 
     @pytest.mark.parametrize("media_tag, expected_path", [
         # Windows backslash paths
@@ -69,18 +43,6 @@ class TestToolMediaReWindowsPaths:
         assert match is not None, f"Should match: {media_tag}"
         assert match.group(1) == expected_path
 
-    # ── Positive: Unix paths still match ───────────────────────────
-
-
-    # ── Negative: invalid paths don't match ────────────────────────
-
-
-    # ── Negative/preserved: old pattern rejects Windows paths ──────
-
-
-    # ── Edge cases ─────────────────────────────────────────────────
-
-
     @pytest.mark.parametrize("media_tag", [
         "MEDIA:C:\\path\\file.jpeg",
         "MEDIA:C:\\path\\file.JPG",
@@ -91,3 +53,31 @@ class TestToolMediaReWindowsPaths:
         """File extensions are matched case-insensitively."""
         match = _TOOL_MEDIA_RE.search(media_tag)
         assert match is not None, f"Should match: {media_tag}"
+
+
+class TestToolMediaReCoversProducerFormats:
+    """The auto-append collector only appends tags this regex accepts, so it must
+    recognize every extension its gated producers can emit. text_to_speech emits
+    whatever ``format``/``output_format`` tts_command_provider validates — aac and
+    amr included — and a miss means the synthesis succeeds but the user receives
+    no audio at all."""
+
+    @pytest.mark.parametrize("fmt", sorted(COMMAND_TTS_OUTPUT_FORMATS))
+    def test_every_tts_output_format_matches(self, fmt):
+        assert _TOOL_MEDIA_RE.fullmatch(f"MEDIA:/home/u/.hermes/audio_cache/tts_1.{fmt}"), (
+            f"TTS output format .{fmt} is dropped by the auto-append collector"
+        )
+
+    def test_aac_tts_result_is_collected(self):
+        """End-to-end: a successful text_to_speech tool result in .aac must yield an
+        auto-appended MEDIA tag (and keep its voice directive) — the regex alone is
+        not the delivery path, the collector is."""
+        messages = [
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "function": {"name": "text_to_speech"}}]},
+            {"role": "tool", "tool_call_id": "c1",
+             "content": "[[audio_as_voice]]\nMEDIA:/root/.hermes/audio_cache/tts_20260101.aac"},
+        ]
+        tags, voice = _collect_auto_append_media_tags(messages)
+        assert tags == ["MEDIA:/root/.hermes/audio_cache/tts_20260101.aac"]
+        assert voice is True

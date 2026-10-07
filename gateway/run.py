@@ -1423,10 +1423,16 @@ def _strip_auto_continue_noise(content: Any) -> Any:
 _JSON_MEDIA_TOOL_PATH_FIELDS = ("host_image", "image", "agent_visible_image")
 
 
-# Extension-anchored MEDIA: matcher (mirrors the dispatch site); a bare ``MEDIA:`` in prose never auto-appends.
+# Extension-anchored MEDIA: matcher for the auto-append collector. It must accept every
+# extension the gated producers (text_to_speech*, image_generate) can emit — the TTS side is
+# tools.tts_command_provider.COMMAND_TTS_OUTPUT_FORMATS — or the artifact is written but never
+# appended, and the user gets silence. It does NOT need all of MEDIA_DELIVERY_EXTS
+# (gateway/platforms/base.py): the dispatch side also delivers unknown extensions via on-disk
+# validation, but only tags this collector accepts ever reach the outgoing text. A bare
+# ``MEDIA:`` in prose never auto-appends.
 _TOOL_MEDIA_RE = re.compile(
     r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-    r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
+    r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|aac|amr|'
     r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
     r'txt|csv|apk|ipa))',
     re.IGNORECASE)
