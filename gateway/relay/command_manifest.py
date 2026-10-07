@@ -3,9 +3,11 @@
 The CONNECTOR holds the Discord token, so the gateway declares its command set on
 the ``hello`` frame and the connector reconciles Discord's registration (idempotent,
 best-effort). MIRRORS the native tree (plugins/platforms/discord/adapter.py
-``_register_slash_commands``) — same names, same descriptions; interactions return
-via the passthrough plane as ordinary "/name args" COMMAND events, so a new entry
-needs NO new handler. Wire shape per entry: {name, description, options?} with
+``_NATIVE_SLASH_COMMAND_SPECS``) — command names one-for-one, in native registration
+order (tests/gateway/relay/test_relay_threads.py enforces it); descriptions and
+options are English simplifications of the localized native slots. Interactions
+return via the passthrough plane as ordinary "/name args" COMMAND events, so a new
+entry needs NO new handler. Wire shape per entry: {name, description, options?} with
 Discord option objects verbatim; names must match ``[a-z0-9_-]{1,32}`` (the
 connector drops invalid entries, never the whole manifest).
 """
@@ -62,6 +64,8 @@ def build_relay_command_manifest() -> List[Dict[str, Any]]:
         _cmd("stop", "Stop the running Hermes agent"),
         _cmd("steer", "Inject a message after the next tool call (no interrupt)",
              _opt("text", "What to tell the agent")),
+        _cmd("plan", "Write a markdown implementation plan (no execution)",
+             _opt("task", "What to plan. Leave empty to infer from the conversation.")),
         _cmd("compress", "Compress conversation context"),
         _cmd("title", "Set or show the session title",
              _opt("text", "New title. Leave empty to show.")),

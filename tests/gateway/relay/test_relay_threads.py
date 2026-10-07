@@ -216,6 +216,36 @@ def test_event_from_wire_reply_to_absent_and_partial():
 # ── hello command manifest ───────────────────────────────────────────────
 
 
+def test_manifest_names_mirror_the_native_tree():
+    """The relay manifest carries every native Discord slash command, one-for-one and in
+    native registration order. The connector builds the relay lane's / picker from THIS
+    manifest, so a native command missing here is undiscoverable there even though
+    plain-text "/<name> args" still falls through to the gateway handler (the native
+    /plan picker commit 83f4524b42 landed without this mirror and /plan vanished from
+    the relay picker)."""
+    from plugins.platforms.discord.adapter import _NATIVE_SLASH_COMMAND_SPECS
+
+    relay_names = [cmd["name"] for cmd in build_relay_command_manifest()]
+    native_names = [spec[0] for spec in _NATIVE_SLASH_COMMAND_SPECS]
+    assert relay_names == native_names, (
+        f"relay/native Discord slash-command drift: "
+        f"missing={sorted(set(native_names) - set(relay_names))} "
+        f"extra={sorted(set(relay_names) - set(native_names))}"
+    )
+
+
+def test_manifest_satisfies_discord_chat_input_rules():
+    """Every name fits ``[a-z0-9_-]{1,32}`` and every description the 100-unit cap: the
+    connector drops invalid entries, so one bad row would silently remove a command from
+    the relay picker."""
+    manifest = build_relay_command_manifest()
+    assert manifest
+    for cmd in manifest:
+        assert re.fullmatch(r"[a-z0-9_-]{1,32}", cmd["name"]), cmd["name"]
+        assert 1 <= len(cmd["description"]) <= 100, cmd["name"]
+        for opt in cmd.get("options", []):
+            assert re.fullmatch(r"[a-z0-9_-]{1,32}", opt["name"]), (cmd["name"], opt["name"])
+            assert 1 <= len(opt["description"]) <= 100, (cmd["name"], opt["name"])
 
 
 # ── auto-thread routing feedback (send-result thread_id) ─────────────────
