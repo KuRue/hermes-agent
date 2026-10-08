@@ -15,6 +15,8 @@ Contract:
 """
 
 import sqlite3
+import threading
+import time
 
 from hermes_state import SessionDB
 from hermes_state_schema import SCHEMA_VERSION
@@ -157,3 +159,51 @@ def test_unperformable_backfill_is_settled_not_retried_forever(tmp_path, monkeyp
         assert calls == ["v18"], "an impossible backfill was retried on every open"
     finally:
         second.close()
+
+
+def test_real_sibling_write_lock_defers_backfill_until_patience_retry(tmp_path):
+    """The central claim against a REAL sibling writer, not an injected OperationalError.
+
+    A second connection holds the state.db write lock, so BOTH the v18 backfill and its
+    marker write contend: the whole init raises and ``_connect_and_init_with_lock_patience``
+    retries the open. Once the sibling releases, the same open completes the backfill and
+    stamps the version. (The injected-error tests above prove the marker state machine; this
+    proves the propagate-and-retry branch end to end. Review evidence note, #134671.)
+    """
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    _regress_version(db, 17)
+    db.close()
+
+    sibling = sqlite3.connect(db_path, timeout=5.0, isolation_level=None)
+    try:
+        sibling.execute("BEGIN IMMEDIATE")
+        sibling.execute("INSERT OR IGNORE INTO state_meta (key, value) VALUES ('sibling-hold', '1')")
+
+        opened = []
+        failure = {}
+
+        def _open():
+            try:
+                opened.append(SessionDB(db_path=db_path))
+            except BaseException as exc:  # pragma: no cover — surfaced via `failure`
+                failure["error"] = exc
+
+        thread = threading.Thread(target=_open, name="sibling-locked-open")
+        thread.start()
+        time.sleep(1.5)  # first init attempt contends (1s busy timeout) and propagates
+        sibling.execute("COMMIT")  # release: the patience retry completes the open
+        thread.join(timeout=25.0)
+        assert not thread.is_alive(), "the open never finished within write patience"
+        assert not failure, f"open failed instead of retrying: {failure.get('error')!r}"
+
+        contended = opened[0]
+        try:
+            assert contended.get_meta(_V18) == "done", "the deferred backfill never landed"
+            assert contended._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == SCHEMA_VERSION
+        finally:
+            contended.close()
+    finally:
+        sibling.close()
