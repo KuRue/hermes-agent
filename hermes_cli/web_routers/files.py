@@ -20,13 +20,13 @@ import tempfile
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
+from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access, offline_tree_access
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_files import (
     _fs_path, _hosted_fs_read_guard, _managed_file_entry, _managed_response_meta, _resolve_managed_path,
@@ -242,6 +242,23 @@ def _refuse_live_database(target: Path) -> None:
     call it via ``asyncio.to_thread``."""
     with _serve_offline(target):
         pass
+
+
+@contextlib.contextmanager
+def _mutate_offline(targets, *, what: str = "write"):
+    """Admission + destructive mutation as ONE serialized lifecycle operation.
+
+    A point-in-time ``_refuse_live_database`` followed by the write leaves a window a
+    ``connect_tracked`` opener enters between check and mutation, then the mutation
+    replaces a live database's file (review F2, #134670). The guard holds the registry
+    lock ``connect_tracked`` opens under across the caller's write/replace/delete.
+    ``targets`` is the full destructive footprint (one path or a list): the registry is
+    keyed per database file, so a recursive delete passes every file it may unlink."""
+    try:
+        with offline_tree_access(targets, what=what):
+            yield
+    except LiveConnectionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _fs_read_bytes(target: Path, limit: Optional[int] = None) -> bytes:
@@ -691,11 +708,17 @@ def _managed_write_result(policy, target: Path, display_path: str) -> dict:
 @router.post("/api/files/upload")
 async def upload_managed_file(payload: ManagedFileUpload, request: Request):
     policy, target, display_path = _managed_write_target(payload.path, request, payload.overwrite)
-    await asyncio.to_thread(_refuse_live_database, target)
     data, _mime_type = _decode_data_url(payload.data_url)
-    with _io_errors("File is not writable", "Could not write file"):
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
+
+    def _write() -> None:
+        # One lifecycle guard across admission and the write: no connect_tracked
+        # opener can enter between the live-database check and write_bytes (F2).
+        with _mutate_offline(target):
+            with _io_errors("File is not writable", "Could not write file"):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+
+    await asyncio.to_thread(_write)
     return _managed_write_result(policy, target, display_path)
 
 
@@ -706,6 +729,7 @@ async def stream_upload_to_path(
     too_large: str,
     not_writable: str,
     write_failed: str,
+    commit: Callable[[Path, Path], None] | None = None,
 ) -> int:
     """Stream a multipart upload to ``target`` in chunks; returns bytes written.
 
@@ -714,7 +738,12 @@ async def stream_upload_to_path(
     ``too_large``), then atomically renames into place. The temp file is
     removed on EVERY non-success exit — including asyncio.CancelledError when a
     browser aborts a large upload mid-stream.
-    """
+
+    ``commit(tmp_path, target)`` replaces the default ``os.replace`` for the
+    final placement: the managed files route passes a callback that runs the
+    rename inside the connection-lifecycle guard, so staging stays asynchronous
+    while admission + placement are one serialized operation (never hold a
+    thread lock across an ``await``; review F2, #134670)."""
     from hermes_cli.web_server import _MANAGED_FILE_MAX_BYTES, _UPLOAD_CHUNK_BYTES
     tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".upload", dir=str(target.parent))
     tmp_path = Path(tmp_name)
@@ -730,7 +759,10 @@ async def stream_upload_to_path(
                 if total > _MANAGED_FILE_MAX_BYTES:
                     raise HTTPException(status_code=413, detail=too_large)
                 out.write(chunk)
-        os.replace(tmp_path, target)
+        if commit is not None:
+            commit(tmp_path, target)
+        else:
+            os.replace(tmp_path, target)
         renamed = True
     except PermissionError:
         raise HTTPException(status_code=403, detail=not_writable)
@@ -753,14 +785,21 @@ async def upload_managed_file_stream(
     """Chunked multipart upload: constant memory and no base64 inflation, unlike
     the JSON data-URL endpoint that trips proxy body-size limits on large archives."""
     policy, target, display_path = _managed_write_target(path, request, overwrite)
-    await asyncio.to_thread(_refuse_live_database, target)
     with _io_errors("File is not writable", "Could not create parent directory"):
         target.parent.mkdir(parents=True, exist_ok=True)
+
+    def _guarded_commit(tmp_path: Path, dest: Path) -> None:
+        # Staging ran unguarded above; admission + placement are one serialized
+        # operation here (F2): the rename happens under the registry lock.
+        with _mutate_offline(dest):
+            os.replace(tmp_path, dest)
+
     await stream_upload_to_path(
         file, target,
         too_large="File is too large",
         not_writable="File is not writable",
         write_failed="Could not write file",
+        commit=_guarded_commit,
     )
     return _managed_write_result(policy, target, display_path)
 
@@ -782,7 +821,6 @@ async def create_managed_directory(payload: ManagedDirectoryCreate, request: Req
 async def delete_managed_file(payload: ManagedFileDelete, request: Request):
     policy, target, display_path = _resolve_managed_path(payload.path, request)
     _reject_sensitive_write(target)
-    await asyncio.to_thread(_refuse_live_database, target)
     if policy.locked_root is not None and target == policy.locked_root:
         raise HTTPException(status_code=400, detail="Cannot delete the managed files root")
     if target.parent == target:
@@ -790,17 +828,42 @@ async def delete_managed_file(payload: ManagedFileDelete, request: Request):
     if not target.exists():
         raise HTTPException(status_code=404, detail="Path not found")
 
-    try:
-        if target.is_dir():
-            if payload.recursive:
-                shutil.rmtree(target)
-            else:
-                target.rmdir()
-        else:
-            target.unlink()
-    except OSError as exc:
-        status_code = 409 if target.is_dir() and not payload.recursive else 500
-        raise HTTPException(status_code=status_code, detail=f"Could not delete path: {exc}")
+    # The destructive footprint: rmtree acts on the whole tree, so a parent-only
+    # sensitive check left protected CHILDREN deletable through their directory
+    # (review F1, #134670). Walk before mutating; an unreadable subtree is a
+    # refusal (fail-closed), never "an empty safe tree".
+    footprint = [target]
+    if target.is_dir() and payload.recursive:
+        try:
+            for root, _dirs, names in os.walk(target):
+                for name in names:
+                    footprint.append(Path(root) / name)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Could not verify the deletion footprint: {exc}",
+            )
+    for descendant in footprint[1:]:
+        _reject_sensitive_write(descendant)
+
+    def _delete() -> None:
+        # Admission over the whole footprint + the unlink/rmtree are one lifecycle
+        # operation: the registry is keyed per file, so every descendant a live
+        # connection could own is checked under the lock the opener takes (F1/F2).
+        try:
+            with _mutate_offline(footprint, what="delete"):
+                if target.is_dir():
+                    if payload.recursive:
+                        shutil.rmtree(target)
+                    else:
+                        target.rmdir()
+                else:
+                    target.unlink()
+        except OSError as exc:
+            status_code = 409 if target.is_dir() and not payload.recursive else 500
+            raise HTTPException(status_code=status_code, detail=f"Could not delete path: {exc}")
+
+    await asyncio.to_thread(_delete)
     return {"ok": True, "path": display_path, **_managed_response_meta(policy)}
 
 
@@ -896,9 +959,19 @@ async def fs_write_text(payload: FsWriteText, profile: Optional[str] = None):
     text = payload.content or ""
     backend = await asyncio.to_thread(_fs_backend, profile)
     if backend is not None:
-        # Guard the REQUESTED path: the adapter resolves and writes in one call, so the
-        # returned target arrives after the write has already landed.
+        # Guard the REQUESTED path and the adapter's EFFECTIVE target: the adapter
+        # resolves and writes in one call, and a relative basename is expanded against
+        # the selected workspace's cwd/home, so the raw request does not name the file
+        # that actually lands (review F3, #134670). ``resolve`` is the same normalization
+        # ``write_text`` performs — validate it before the effect, not the echo after.
         _reject_sensitive_write(payload.path)
+        resolve = getattr(backend, "resolve", None)
+        if resolve is not None:
+            try:
+                effective = resolve(payload.path)
+            except Exception as exc:
+                _raise_fs_backend_error(exc)
+            _reject_sensitive_write(effective)
         try:
             target, byte_size = await asyncio.to_thread(
                 backend.write_text,
@@ -913,10 +986,11 @@ async def fs_write_text(payload: FsWriteText, profile: Optional[str] = None):
     target = _fs_path(payload.path, decode_fallback=False)
     _reject_sensitive_write(target)
     # Whole-file replace is destructive to a live SQLite store (this process holds
-    # state.db open), and _serve_offline already refuses that on the read side.
+    # state.db open). The admission and the replace run as ONE guarded operation in
+    # ``_save`` below — a point-in-time pre-check here would leave the same
+    # opener-between-check-and-write window (review F2, #134670).
     # Not applied to the SSH backend: offline_file_access is a local-connection
     # registry, so a remote database is not one of ours to guard here.
-    await asyncio.to_thread(_refuse_live_database, target)
     if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content too large")
 
@@ -936,16 +1010,22 @@ async def fs_write_text(payload: FsWriteText, profile: Optional[str] = None):
     if not target.parent.is_dir():
         raise HTTPException(status_code=400, detail="Parent directory does not exist")
 
-    tmp = target.with_name(f".{target.name}.hermes-tmp-{os.getpid()}")
-    try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, target)
-    except PermissionError:
-        tmp.unlink(missing_ok=True)
-        raise HTTPException(status_code=403, detail="File is not writable")
-    except OSError as exc:
-        tmp.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"Could not write file: {exc}")
+    def _save() -> None:
+        # Admission + the whole-file replace as one lifecycle operation: no tracked
+        # opener can enter between the live-database check and os.replace (F2).
+        tmp = target.with_name(f".{target.name}.hermes-tmp-{os.getpid()}")
+        try:
+            with _mutate_offline(target):
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, target)
+        except PermissionError:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(status_code=403, detail="File is not writable")
+        except OSError as exc:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail=f"Could not write file: {exc}")
+
+    await asyncio.to_thread(_save)
     return {"ok": True, "path": str(target), "byteSize": len(text.encode("utf-8"))}
 
 

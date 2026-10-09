@@ -2,6 +2,9 @@
 
 from pathlib import Path
 import base64
+import os
+import posixpath
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -835,3 +838,205 @@ def test_dangling_symlink_does_not_break_directory_listing(forced_files_client):
     # Reading or downloading the broken symlink directly is still an error.
     assert client.get("/api/files/read", params={"path": str(root / "dangling")}).status_code == 404
     assert client.get("/api/files/download", params={"path": str(root / "dangling")}).status_code == 404
+
+
+# ── Review repairs (#134670): F1 footprint, F2 lifecycle, F3 effective target ──
+
+def test_recursive_delete_refuses_a_protected_descendant(forced_files_client):
+    """F1: rmtree acts on the whole tree, so the parent-only sensitive check left
+    protected CHILDREN deletable through their ordinary parent."""
+    client, root = forced_files_client
+    parent = root / "project"
+    (parent / "sub").mkdir(parents=True)
+    (parent / "notes.txt").write_text("keep", encoding="utf-8")
+    env_child = parent / "sub" / ".env"
+    env_child.write_text("OPENAI_API_KEY=sk-real\n", encoding="utf-8")
+
+    resp = client.request("DELETE", "/api/files", json={"path": str(parent), "recursive": True})
+
+    assert resp.status_code == 409, resp.text
+    assert env_child.read_text(encoding="utf-8") == "OPENAI_API_KEY=sk-real\n"
+    assert (parent / "notes.txt").exists(), "an unprotected sibling was removed by the refused delete"
+
+
+def test_recursive_delete_still_removes_ordinary_trees(forced_files_client):
+    client, root = forced_files_client
+    parent = root / "project"
+    (parent / "sub").mkdir(parents=True)
+    (parent / "notes.txt").write_text("gone", encoding="utf-8")
+
+    resp = client.request("DELETE", "/api/files", json={"path": str(parent), "recursive": True})
+
+    assert resp.status_code == 200, resp.text
+    assert not parent.exists()
+
+
+def test_recursive_delete_fails_closed_on_an_unverifiable_footprint(forced_files_client, monkeypatch):
+    """F1: an unreadable subtree is a refusal, never 'an empty safe tree'."""
+    client, root = forced_files_client
+    parent = root / "project"
+    parent.mkdir(parents=True)
+    (parent / "notes.txt").write_text("keep", encoding="utf-8")
+
+    def _unwalkable(_target):
+        raise OSError("EACCES: subtree unreadable")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(_rt_files.os, "walk", _unwalkable)
+
+    resp = client.request("DELETE", "/api/files", json={"path": str(parent), "recursive": True})
+
+    assert resp.status_code == 409, resp.text
+    assert parent.exists() and (parent / "notes.txt").exists()
+
+
+def test_recursive_delete_refuses_a_live_database_descendant(forced_files_client):
+    """F1/F2: the registry is keyed per file — a live tracked DB inside the tree must
+    block the recursive delete of its parent, with the tree left intact."""
+    from hermes_state import SessionDB
+
+    client, root = forced_files_client
+    parent = root / "project"
+    (parent / "data").mkdir(parents=True)
+    session_db = SessionDB(db_path=parent / "data" / "state.db")
+    try:
+        resp = client.request("DELETE", "/api/files", json={"path": str(parent), "recursive": True})
+        assert resp.status_code == 409, resp.text
+        assert (parent / "data" / "state.db").exists()
+        assert (parent / "data").exists()
+    finally:
+        session_db.close()
+
+
+def _lock_probing_os(monkeypatch, record, key):
+    """Replace the route module's ``os`` with a proxy that records whether the
+    connection-lifecycle registry lock is held by the calling thread."""
+    import hermes_cli.sqlite_safe_read as _ssr
+    real_os = _rt_files.os
+    probe = types.SimpleNamespace(**vars(real_os))
+
+    def _probe_replace(tmp, dst):
+        record[key] = _ssr._live_lock._is_owned()
+        return real_os.replace(tmp, dst)
+
+    probe.replace = _probe_replace
+    monkeypatch.setattr(_rt_files, "os", probe)
+    return probe
+
+
+def test_write_text_replaces_under_the_connection_lifecycle_lock(forced_files_client, monkeypatch):
+    """F2 structural: admission and the destructive os.replace are one serialized
+    operation — the write runs while the registry lock is owned by this thread."""
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / "notes.txt"
+    target.write_text("old", encoding="utf-8")
+
+    record = {}
+    _lock_probing_os(monkeypatch, record, "write-text")
+
+    resp = client.post(
+        "/api/fs/write-text", json={"path": str(target), "content": "new"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert record.get("write-text") is True, "os.replace ran outside the lifecycle guard"
+    assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_stream_upload_commits_under_the_connection_lifecycle_lock(forced_files_client, monkeypatch):
+    """F2 structural: multipart staging is unguarded, but the final placement runs
+    inside the guard."""
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / "upload.bin"
+
+    record = {}
+    _lock_probing_os(monkeypatch, record, "upload-commit")
+
+    resp = client.post(
+        "/api/files/upload-stream",
+        data={"path": str(target), "overwrite": "true"},
+        files={"file": ("upload.bin", b"payload")},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert record.get("upload-commit") is True, "the streamed commit ran outside the lifecycle guard"
+    assert target.read_bytes() == b"payload"
+
+
+def test_delete_runs_under_the_connection_lifecycle_lock(forced_files_client, monkeypatch):
+    """F2 structural: the unlink itself executes while the registry lock is held."""
+    import hermes_cli.sqlite_safe_read as _ssr
+    client, root = forced_files_client
+    target = root / "notes.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("gone", encoding="utf-8")
+
+    record = {}
+
+    real_shutil = _rt_files.shutil
+    real_rmtree = real_shutil.rmtree
+
+    def _probe_rmtree(path, *args, **kwargs):
+        record["delete"] = _ssr._live_lock._is_owned()
+        return real_rmtree(path, *args, **kwargs)
+
+    probe_shutil = types.SimpleNamespace(**vars(real_shutil))
+    probe_shutil.rmtree = _probe_rmtree
+    monkeypatch.setattr(_rt_files, "shutil", probe_shutil)
+
+    project = root / "project"
+    project.mkdir(parents=True)
+    (project / "notes.txt").write_text("gone", encoding="utf-8")
+
+    resp = client.request("DELETE", "/api/files", json={"path": str(project), "recursive": True})
+
+    assert resp.status_code == 200, resp.text
+    assert record.get("delete") is True, "rmtree ran outside the lifecycle guard"
+    assert not project.exists()
+
+
+class _WorkspaceBackend:
+    """SshWorkspaceFs-shaped fake: ``resolve`` is the same cwd/home expansion
+    ``write_text`` performs (review F3)."""
+
+    def __init__(self, cwd):
+        self._cwd = cwd
+        self.writes = []
+
+    def resolve(self, path):
+        raw = str(path or "").strip()
+        if raw.startswith("~"):
+            raw = "/home/remote" + raw[1:]
+        elif not raw.startswith("/"):
+            raw = posixpath.join(self._cwd, raw)
+        return posixpath.normpath(raw)
+
+    def write_text(self, path, text, *, max_bytes=None):
+        effective = self.resolve(path)
+        self.writes.append(effective)
+        return (effective, len(text))
+
+
+def test_remote_write_policy_evaluates_the_effective_target(monkeypatch, forced_files_client):
+    """F3: a relative basename is expanded against the selected workspace's cwd, so the
+    policy must judge the adapter's effective target — refusal/success/refusal for the
+    SAME request across protected/ordinary/protected workspaces."""
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    holder = {"backend": _WorkspaceBackend("/home/remote/work")}
+    monkeypatch.setattr(_rt_files, "_fs_backend", lambda profile=None: holder["backend"])
+
+    ok = client.post("/api/fs/write-text", json={"path": "notes.txt", "content": "hi"})
+    assert ok.status_code == 200, ok.text
+    assert holder["backend"].writes == ["/home/remote/work/notes.txt"]
+
+    holder["backend"] = _WorkspaceBackend("/home/remote/.hermes/vault")
+    refused = client.post("/api/fs/write-text", json={"path": "notes.txt", "content": "hi"})
+    assert refused.status_code == 409, refused.text
+    assert holder["backend"].writes == [], "the adapter was invoked for a protected effective target"
+
+    home_alias = client.post("/api/fs/write-text", json={"path": "~/.hermes/.env", "content": "x"})
+    assert home_alias.status_code == 409, home_alias.text
+    assert holder["backend"].writes == [], "a ~-alias to a credential file reached the adapter"
